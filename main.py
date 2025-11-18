@@ -171,6 +171,49 @@ def load_config():
 
     config["TWITTER_TRENDS"] = twitter_trends
 
+    twitter_api_cfg = config_data.get("twitter_api", {}) or {}
+    twitter_api = {
+        "enabled": bool(twitter_api_cfg.get("enabled", False)),
+        "bearer_token_env": (twitter_api_cfg.get("bearer_token_env") or "TWITTER_BEARER_TOKEN").strip()
+        or "TWITTER_BEARER_TOKEN",
+        "max_results": min(100, max(5, int(twitter_api_cfg.get("max_results", 10) or 10))),
+        "timeout": max(5, int(twitter_api_cfg.get("timeout", 15) or 15)),
+        "queries": [],
+        "bearer_token": "",
+    }
+
+    bearer_env_name = twitter_api["bearer_token_env"]
+    bearer_token = os.environ.get(bearer_env_name, "").strip()
+    twitter_api["bearer_token"] = bearer_token
+
+    for query_cfg in twitter_api_cfg.get("queries", []) or []:
+        if not isinstance(query_cfg, dict):
+            continue
+
+        query_id = (query_cfg.get("id") or "").strip()
+        query_name = (query_cfg.get("name") or query_id or "X API 查询")
+        query_expr = (query_cfg.get("query") or "").strip()
+
+        if not query_id or not query_expr:
+            continue
+
+        twitter_api["queries"].append(
+            {
+                "id": query_id,
+                "name": query_name,
+                "query": query_expr,
+                "max_results": min(
+                    100,
+                    max(
+                        5,
+                        int(query_cfg.get("max_results", twitter_api["max_results"]) or twitter_api["max_results"]),
+                    ),
+                ),
+            }
+        )
+
+    config["TWITTER_API"] = twitter_api
+
     # 通知渠道配置（环境变量优先）
     notification = config_data.get("notification", {})
     webhooks = notification.get("webhooks", {})
@@ -809,6 +852,79 @@ class TwitterTrendsFetcher:
             f"Twitter趋势 {slug} 抓取 {len(topics)} 条（{timestamp_label or '未知时间段'}）"
         )
         return topics
+
+
+class TwitterAPIClient:
+    """使用 Twitter/X 官方 API 获取指定查询的最新推文"""
+
+    SEARCH_URL = "https://api.twitter.com/2/tweets/search/recent"
+
+    def __init__(self, bearer_token: str, timeout: int = 15) -> None:
+        if not bearer_token:
+            raise ValueError("Twitter API Bearer Token 不能为空")
+
+        self.bearer_token = bearer_token
+        self.timeout = timeout
+        self.session = requests.Session()
+
+    def fetch_recent_tweets(self, query: str, max_results: int = 10) -> List[Dict]:
+        query = (query or "").strip()
+        if not query:
+            raise ValueError("Twitter API 查询语句不能为空")
+
+        params = {
+            "query": query,
+            "max_results": max(5, min(100, max_results or 10)),
+            "tweet.fields": "created_at,lang,public_metrics,author_id",  # noqa: E501
+            "expansions": "author_id",
+            "user.fields": "name,username,verified",
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.bearer_token}",
+            "User-Agent": "TrendRadarBot/1.0",
+        }
+
+        response = self.session.get(
+            self.SEARCH_URL, params=params, headers=headers, timeout=self.timeout
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        users_map = {
+            user.get("id"): user
+            for user in data.get("includes", {}).get("users", [])
+            if user.get("id")
+        }
+
+        tweets: List[Dict] = []
+        for item in data.get("data", []):
+            tweet_id = item.get("id")
+            if not tweet_id:
+                continue
+
+            author_id = item.get("author_id")
+            user_info = users_map.get(author_id, {})
+            username = user_info.get("username") or author_id
+            tweet_url = f"https://twitter.com/{username}/status/{tweet_id}" if username else f"https://twitter.com/i/web/status/{tweet_id}"  # noqa: E501
+
+            tweets.append(
+                {
+                    "id": tweet_id,
+                    "text": clean_title(item.get("text", "")),
+                    "author_id": author_id,
+                    "author_name": user_info.get("name", username or "Unknown"),
+                    "username": username,
+                    "created_at": item.get("created_at", ""),
+                    "lang": item.get("lang", ""),
+                    "retweets": item.get("public_metrics", {}).get("retweet_count"),
+                    "likes": item.get("public_metrics", {}).get("like_count"),
+                    "replies": item.get("public_metrics", {}).get("reply_count"),
+                    "url": tweet_url,
+                }
+            )
+
+        return tweets
 
 
 # === 数据处理 ===
@@ -5200,6 +5316,87 @@ class NewsAnalyzer:
                 interval = twitter_cfg.get("request_interval", 0)
                 if interval > 0:
                     time.sleep(interval)
+
+        twitter_api_cfg = CONFIG.get("TWITTER_API", {})
+        if twitter_api_cfg.get("enabled") and twitter_api_cfg.get("queries"):
+            bearer_token = twitter_api_cfg.get("bearer_token", "").strip()
+            if not bearer_token:
+                env_name = twitter_api_cfg.get("bearer_token_env", "TWITTER_BEARER_TOKEN")
+                print(
+                    f"Twitter API 已启用，但未在环境变量 {env_name} 中检测到 Bearer Token，已跳过官方 API 抓取"
+                )
+            else:
+                try:
+                    twitter_api_client = TwitterAPIClient(
+                        bearer_token=bearer_token,
+                        timeout=max(5, twitter_api_cfg.get("timeout", 15) or 15),
+                    )
+                except Exception as exc:
+                    print(f"初始化 Twitter API 客户端失败: {exc}")
+                    twitter_api_client = None
+
+                if twitter_api_client:
+                    for query_cfg in twitter_api_cfg.get("queries", []):
+                        query_id = query_cfg.get("id")
+                        query_name = query_cfg.get("name") or query_id
+                        query_expr = query_cfg.get("query")
+                        per_query_limit = query_cfg.get(
+                            "max_results", twitter_api_cfg.get("max_results", 10)
+                        )
+
+                        if not query_id or not query_expr:
+                            continue
+
+                        print(
+                            f"开始通过 Twitter API 抓取: {query_name} ({query_expr})"
+                        )
+                        try:
+                            tweets = twitter_api_client.fetch_recent_tweets(
+                                query_expr, max_results=per_query_limit
+                            )
+                            if not tweets:
+                                print(f"Twitter API 查询 {query_name} 无数据返回")
+                                failed_ids.append(query_id)
+                                continue
+
+                            id_to_name[query_id] = query_name
+                            results[query_id] = {}
+                            for index, tweet in enumerate(tweets, 1):
+                                text = tweet.get("text")
+                                if not text:
+                                    continue
+
+                                title = f"{tweet.get('author_name', '未知作者')}：{text}".strip()
+                                url = tweet.get("url") or ""
+                                metadata = {
+                                    "tweetId": tweet.get("id"),
+                                    "username": tweet.get("username"),
+                                    "createdAt": tweet.get("created_at"),
+                                    "lang": tweet.get("lang"),
+                                    "likes": tweet.get("likes"),
+                                    "retweets": tweet.get("retweets"),
+                                    "replies": tweet.get("replies"),
+                                    "source": "twitter_api",
+                                }
+
+                                results[query_id][title] = {
+                                    "ranks": [index],
+                                    "url": url,
+                                    "mobileUrl": url,
+                                    "metadata": metadata,
+                                }
+
+                            print(
+                                f"Twitter API 查询 {query_name} 获取完成，共 {len(results[query_id])} 条"
+                            )
+                        except requests.HTTPError as http_err:
+                            print(
+                                f"Twitter API 查询 {query_name} HTTP 错误: {http_err.response.status_code if http_err.response else http_err}"
+                            )
+                            failed_ids.append(query_id)
+                        except Exception as exc:
+                            print(f"Twitter API 查询 {query_name} 抓取失败: {exc}")
+                            failed_ids.append(query_id)
 
         title_file = save_titles_to_file(results, id_to_name, failed_ids)
         print(f"标题已保存到: {title_file}")

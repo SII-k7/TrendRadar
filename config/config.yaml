@@ -120,3 +120,18 @@ twitter_trends:
       name: "X 趋势 · 美国"
       slug: "united-states"
       limit: 20
+
+# X (Twitter) 官方 API 配置
+# 通过 Twitter/X 官方 API 获取特定关键词/话题的最新推文
+twitter_api:
+  enabled: true
+  bearer_token_env: "TWITTER_BEARER_TOKEN"   # 请将 Bearer Token 写入同名环境变量
+  max_results: 10                            # 每个查询最多返回多少条推文（5-100）
+  timeout: 15                                # 调用官方 API 的超时时间（秒）
+  queries:
+    - id: "x-topic-ai"
+      name: "X · 人工智能"
+      query: "#AI lang:zh -is:retweet"
+    - id: "x-topic-finance"
+      name: "X · 金融市场"
+      query: "(A股 OR 港股 OR 恒指) lang:zh -is:retweet"
