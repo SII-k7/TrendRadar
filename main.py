@@ -143,6 +143,7 @@ def load_config():
         "request_interval": max(0, int(twitter_trends_cfg.get("request_interval", 2) or 0)),
         "timeout": max(5, int(twitter_trends_cfg.get("timeout", 12) or 12)),
         "use_proxy": bool(twitter_trends_cfg.get("use_proxy", False)),
+        "proxy_url": (twitter_trends_cfg.get("proxy_url") or "").strip(),
         "regions": [],
     }
 
@@ -5135,7 +5136,17 @@ class NewsAnalyzer:
 
         twitter_cfg = CONFIG.get("TWITTER_TRENDS", {})
         if twitter_cfg.get("enabled") and twitter_cfg.get("regions"):
-            proxy_for_twitter = self.proxy_url if twitter_cfg.get("use_proxy") else None
+            configured_proxy = (twitter_cfg.get("proxy_url") or "").strip()
+            if configured_proxy:
+                proxy_for_twitter = configured_proxy
+            elif twitter_cfg.get("use_proxy"):
+                proxy_for_twitter = self.proxy_url
+            else:
+                proxy_for_twitter = None
+
+            if twitter_cfg.get("use_proxy") and not proxy_for_twitter:
+                print("Twitter 趋势抓取需要代理，但未检测到可用代理，请检查配置或本地代理服务")
+
             twitter_fetcher = TwitterTrendsFetcher(
                 base_url=twitter_cfg.get("base_url", "https://trends24.in"),
                 proxy_url=proxy_for_twitter,

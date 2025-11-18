@@ -110,6 +110,7 @@ twitter_trends:
   request_interval: 2       # 多个地区连续抓取时的间隔（秒）
   timeout: 12               # HTTP 请求超时（秒）
   use_proxy: false          # 如需通过本地代理访问 trends24，可开启
+  proxy_url: ""             # 仅用于 Twitter 趋势抓取的代理，如 http://127.0.0.1:7890
   regions:
     - id: "x-china"
       name: "X 趋势 · 中国"
