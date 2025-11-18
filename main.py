@@ -1,5 +1,6 @@
 # coding=utf-8
 
+import copy
 import json
 import os
 import random
@@ -18,6 +19,8 @@ from typing import Dict, List, Tuple, Optional, Union
 import pytz
 import requests
 import yaml
+from bs4 import BeautifulSoup
+from urllib.parse import quote_plus
 
 
 VERSION = "3.0.5"
@@ -131,6 +134,41 @@ def load_config():
         "PLATFORMS": config_data["platforms"],
     }
 
+    twitter_trends_cfg = config_data.get("twitter_trends", {}) or {}
+    twitter_trends = {
+        "enabled": bool(twitter_trends_cfg.get("enabled", False)),
+        "base_url": twitter_trends_cfg.get("base_url", "https://trends24.in").rstrip("/"),
+        "default_limit": max(1, int(twitter_trends_cfg.get("default_limit", 20) or 20)),
+        "request_interval": max(0, int(twitter_trends_cfg.get("request_interval", 2) or 0)),
+        "timeout": max(5, int(twitter_trends_cfg.get("timeout", 12) or 12)),
+        "use_proxy": bool(twitter_trends_cfg.get("use_proxy", False)),
+        "regions": [],
+    }
+
+    for region in twitter_trends_cfg.get("regions", []) or []:
+        if not isinstance(region, dict):
+            continue
+
+        slug = (region.get("slug") or region.get("path") or "").strip()
+        if not slug:
+            continue
+
+        region_id = region.get("id") or slug.replace("/", "-")
+        region_name = region.get("name") or f"X趋势 · {slug}"
+        twitter_trends["regions"].append(
+            {
+                "id": region_id,
+                "name": region_name,
+                "slug": slug.strip("/"),
+                "limit": max(
+                    1,
+                    int(region.get("limit", twitter_trends["default_limit"]) or twitter_trends["default_limit"]),
+                ),
+            }
+        )
+
+    config["TWITTER_TRENDS"] = twitter_trends
+
     # 通知渠道配置（环境变量优先）
     notification = config_data.get("notification", {})
     webhooks = notification.get("webhooks", {})
@@ -216,6 +254,125 @@ print("正在加载配置...")
 CONFIG = load_config()
 print(f"TrendRadar v{VERSION} 配置加载完成")
 print(f"监控平台数量: {len(CONFIG['PLATFORMS'])}")
+
+
+DEFAULT_TOPIC_SECTIONS = [
+    {
+        "id": "ah_markets",
+        "name": "A股 / H股焦点",
+        "include": [
+            "a股",
+            "沪指",
+            "深成指",
+            "创业板",
+            "科创",
+            "港股",
+            "恒生",
+            "恒指",
+            "h股",
+            "券商",
+            "北向",
+            "南向",
+            "ah股",
+            "蓝筹",
+            "收盘",
+            "开盘",
+            "中概",
+            "上证",
+        ],
+        "exclude": ["美股", "纳指", "道指", "道琼", "标普"],
+        "max_items": 6,
+        "exclusive": True,
+        "min_items": 3,
+        "fallback_keywords": [
+            "股市",
+            "指数",
+            "行情",
+            "涨",
+            "跌",
+            "市场",
+        ],
+    },
+    {
+        "id": "domestic_politics",
+        "name": "国内热点 · 时政",
+        "include": [
+            "国务院",
+            "中央",
+            "中共中央",
+            "国常会",
+            "发改委",
+            "财政部",
+            "工信部",
+            "两会",
+            "十四五",
+            "时政",
+            "政策",
+            "部委",
+            "新政",
+            "改革",
+            "总书记",
+            "外交部",
+            "央行",
+            "国内",
+            "政务",
+            "规划",
+            "国资",
+            "住建部",
+            "金融监管",
+        ],
+        "exclude": ["美股", "港股"],
+        "max_items": 6,
+        "exclusive": True,
+        "min_items": 3,
+        "fallback_keywords": [
+            "中国",
+            "国内",
+            "本土",
+            "政策",
+            "权威",
+        ],
+    },
+    {
+        "id": "global_politics",
+        "name": "海外热点 · 时政",
+        "include": [
+            "美国",
+            "白宫",
+            "拜登",
+            "特朗普",
+            "欧盟",
+            "欧洲",
+            "英国",
+            "德国",
+            "法国",
+            "俄罗斯",
+            "乌克兰",
+            "以色列",
+            "巴以",
+            "中东",
+            "伊朗",
+            "朝鲜",
+            "日本",
+            "韩国",
+            "联合国",
+            "g7",
+            "g20",
+            "北约",
+        ],
+        "exclude": ["a股", "港股"],
+        "max_items": 6,
+        "exclusive": True,
+        "min_items": 3,
+        "fallback_keywords": [
+            "海外",
+            "国际",
+            "全球",
+            "外媒",
+            "境外",
+        ],
+    },
+]
 
 
 # === 工具函数 ===
@@ -552,6 +709,106 @@ class DataFetcher:
         return results, id_to_name, failed_ids
 
 
+class TwitterTrendsFetcher:
+    """基于 trends24.in 的 X (Twitter) 趋势抓取器"""
+
+    BASE_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    def __init__(
+        self,
+        base_url: str = "https://trends24.in",
+        proxy_url: Optional[str] = None,
+        timeout: int = 12,
+    ) -> None:
+        self.base_url = base_url.rstrip("/") or "https://trends24.in"
+        self.proxy_url = proxy_url
+        self.timeout = timeout
+        self.session = requests.Session()
+
+    def _get_proxies(self) -> Optional[Dict[str, str]]:
+        if self.proxy_url:
+            return {"http": self.proxy_url, "https": self.proxy_url}
+        return None
+
+    def _ensure_url(self, href: str, title: str) -> str:
+        href = (href or "").strip()
+        if href.startswith("//"):
+            return f"https:{href}"
+        if href.startswith("http"):
+            return href
+        if href:
+            # 相对路径
+            return f"{self.base_url}/{href.lstrip('/')}"
+        encoded = quote_plus(title)
+        return f"https://twitter.com/search?q={encoded}"
+
+    def fetch_region_trends(self, slug: str, limit: int = 20) -> List[Dict]:
+        slug = (slug or "").strip("/")
+        if not slug:
+            raise ValueError("slug 不能为空")
+
+        url = f"{self.base_url}/{slug}/"
+        response = self.session.get(
+            url,
+            headers=self.BASE_HEADERS,
+            proxies=self._get_proxies(),
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        first_card = soup.select_one("div.trend-card")
+        if not first_card:
+            raise ValueError("未找到趋势卡片")
+
+        timestamp_el = first_card.select_one("div.trend-card__header h5")
+        timestamp_label = timestamp_el.get_text(strip=True) if timestamp_el else ""
+
+        topics: List[Dict] = []
+        seen_titles = set()
+
+        for li in first_card.select("ol li"):
+            link = li.find("a")
+            if not link:
+                continue
+
+            title = clean_title(link.get_text(" ", strip=True))
+            if not title or title.lower() in seen_titles:
+                continue
+
+            seen_titles.add(title.lower())
+            final_url = self._ensure_url(link.get("href", ""), title)
+            tweet_count_el = li.find("span", string=re.compile(r"\d"))
+            tweet_count = (
+                clean_title(tweet_count_el.get_text(" ", strip=True))
+                if tweet_count_el
+                else ""
+            )
+
+            topics.append(
+                {
+                    "title": title,
+                    "url": final_url,
+                    "tweet_count": tweet_count,
+                    "timestamp": timestamp_label,
+                }
+            )
+
+            if len(topics) >= limit:
+                break
+
+        print(
+            f"Twitter趋势 {slug} 抓取 {len(topics)} 条（{timestamp_label or '未知时间段'}）"
+        )
+        return topics
+
+
 # === 数据处理 ===
 def save_titles_to_file(results: Dict, id_to_name: Dict, failed_ids: List) -> str:
     """保存标题到文件"""
@@ -655,6 +912,78 @@ def load_frequency_words(
             )
 
     return processed_groups, filter_words
+
+
+def load_topic_sections(config_path: Optional[str] = None) -> List[Dict]:
+    """加载话题板块配置"""
+    def _normalize_sections(raw_sections: List[Dict]) -> List[Dict]:
+        normalized = []
+        for section in raw_sections:
+            if not isinstance(section, dict):
+                continue
+
+            include = [
+                word.strip().lower()
+                for word in section.get("include", [])
+                if isinstance(word, str) and word.strip()
+            ]
+            exclude = [
+                word.strip().lower()
+                for word in section.get("exclude", [])
+                if isinstance(word, str) and word.strip()
+            ]
+            fallback_keywords = [
+                word.strip().lower()
+                for word in section.get("fallback_keywords", [])
+                if isinstance(word, str) and word.strip()
+            ]
+            min_items = max(0, int(section.get("min_items", 0)))
+
+            if not include:
+                continue
+
+            normalized.append(
+                {
+                    "id": section.get("id") or section.get("name"),
+                    "name": section.get("name", "热点分区"),
+                    "include": include,
+                    "exclude": exclude,
+                    "max_items": int(section.get("max_items", 5)),
+                    "exclusive": bool(section.get("exclusive", True)),
+                    "min_items": min_items,
+                    "fallback_keywords": fallback_keywords,
+                }
+            )
+
+        return normalized
+
+    if config_path is None:
+        config_path = os.environ.get(
+            "TOPIC_SECTIONS_PATH", "config/topic_sections.yaml"
+        )
+
+    config_file = Path(config_path)
+    if not config_file.exists():
+        print("未找到话题板块配置文件，将使用默认配置")
+        return _normalize_sections(copy.deepcopy(DEFAULT_TOPIC_SECTIONS))
+
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+
+        raw_sections = data.get("sections", [])
+        if not isinstance(raw_sections, list):
+            raise ValueError("sections 配置应为列表")
+
+        processed_sections = _normalize_sections(raw_sections)
+
+        if not processed_sections:
+            return _normalize_sections(copy.deepcopy(DEFAULT_TOPIC_SECTIONS))
+
+        return processed_sections
+    except Exception as exc:
+        print(f"加载话题板块配置失败，使用默认配置: {exc}")
+        return _normalize_sections(copy.deepcopy(DEFAULT_TOPIC_SECTIONS))
 
 
 def parse_file_titles(file_path: Path) -> Tuple[Dict, Dict]:
@@ -938,6 +1267,162 @@ def calculate_news_weight(
     )
 
     return total_weight
+
+
+def categorize_titles_by_sections(
+    stats: List[Dict], section_configs: List[Dict]
+) -> List[Dict]:
+    """基于关键词配置对热点新闻进行分类"""
+    if not stats or not section_configs:
+        return []
+
+    candidates = []
+    for stat in stats:
+        for title_data in stat.get("titles", []):
+            candidate = title_data.copy()
+            candidate.setdefault("rank_threshold", CONFIG["RANK_THRESHOLD"])
+            candidate["keyword_group"] = stat.get("word", "")
+            candidate["weight"] = calculate_news_weight(candidate)
+            candidate["_normalized_title"] = candidate.get("title", "").lower()
+            candidates.append(candidate)
+
+    if not candidates:
+        return []
+
+    results = []
+    used_titles = set()
+
+    for section in section_configs:
+        include = section.get("include", [])
+        exclude = section.get("exclude", [])
+        max_items = section.get("max_items", 5)
+        exclusive = section.get("exclusive", True)
+        fallback_keywords = section.get("fallback_keywords", [])
+        target_min_items = min(max_items, section.get("min_items", 0))
+
+        def matches_keywords(candidate_dict: Dict, keywords: List[str]) -> bool:
+            if not keywords:
+                return True
+            normalized_title = candidate_dict.get("_normalized_title", "")
+            return any(keyword in normalized_title for keyword in keywords)
+
+        def violates_exclude(candidate_dict: Dict) -> bool:
+            if not exclude:
+                return False
+            return matches_keywords(candidate_dict, exclude)
+
+        matched = []
+        for candidate in candidates:
+            title_text = candidate.get("title", "")
+            if not title_text:
+                continue
+
+            if exclusive and title_text in used_titles:
+                continue
+
+            if include and not matches_keywords(candidate, include):
+                continue
+
+            if violates_exclude(candidate):
+                continue
+
+            matched.append(candidate)
+
+        matched.sort(
+            key=lambda x: (
+                -x.get("weight", 0),
+                min(x.get("ranks", [])) if x.get("ranks") else 999,
+                -x.get("count", 1),
+            )
+        )
+
+        selected = []
+        selected_titles = set()
+
+        def can_use_candidate(candidate_dict: Dict) -> bool:
+            title_text = candidate_dict.get("title", "")
+            if not title_text:
+                return False
+            if title_text in selected_titles:
+                return False
+            if exclusive and title_text in used_titles:
+                return False
+            if violates_exclude(candidate_dict):
+                return False
+            return True
+
+        def append_candidate(candidate_dict: Dict, reason: Optional[str] = None):
+            entry = candidate_dict.copy()
+            entry.pop("_normalized_title", None)
+            if reason:
+                entry["_fallback_reason"] = reason
+            else:
+                entry.pop("_fallback_reason", None)
+            selected.append(entry)
+            title_text = entry.get("title", "")
+            if title_text:
+                selected_titles.add(title_text)
+                if exclusive:
+                    used_titles.add(title_text)
+
+        def pick_from_candidates(source: List[Dict], reason: Optional[str] = None):
+            for candidate in source:
+                if len(selected) >= max_items:
+                    break
+                if not can_use_candidate(candidate):
+                    continue
+                append_candidate(candidate, reason)
+
+        pick_from_candidates(matched)
+
+        if len(selected) < target_min_items and fallback_keywords:
+            fallback_matches = []
+            for candidate in candidates:
+                if candidate in matched:
+                    continue
+                if not can_use_candidate(candidate):
+                    continue
+                if not matches_keywords(candidate, fallback_keywords):
+                    continue
+                fallback_matches.append(candidate)
+
+            fallback_matches.sort(
+                key=lambda x: (
+                    -x.get("weight", 0),
+                    min(x.get("ranks", [])) if x.get("ranks") else 999,
+                    -x.get("count", 1),
+                )
+            )
+
+            pick_from_candidates(fallback_matches, reason="keyword_fallback")
+
+        if len(selected) < target_min_items:
+            general_pool = []
+            for candidate in candidates:
+                if not can_use_candidate(candidate):
+                    continue
+                general_pool.append(candidate)
+
+            general_pool.sort(
+                key=lambda x: (
+                    -x.get("weight", 0),
+                    min(x.get("ranks", [])) if x.get("ranks") else 999,
+                    -x.get("count", 1),
+                )
+            )
+
+            pick_from_candidates(general_pool, reason="global_fallback")
+
+        if selected:
+            results.append(
+                {
+                    "id": section.get("id") or section.get("name"),
+                    "name": section.get("name", section.get("id", "热点板块")),
+                    "items": selected,
+                }
+            )
+
+    return results
 
 
 def matches_word_groups(
@@ -1428,6 +1913,15 @@ def prepare_report_data(
             }
         )
 
+    section_highlights: List[Dict] = []
+    try:
+        topic_sections = load_topic_sections()
+        section_highlights = categorize_titles_by_sections(
+            processed_stats, topic_sections
+        )
+    except Exception as exc:
+        print(f"生成精选板块失败: {exc}")
+
     return {
         "stats": processed_stats,
         "new_titles": processed_new_titles,
@@ -1435,6 +1929,7 @@ def prepare_report_data(
         "total_new_count": sum(
             len(source["titles"]) for source in processed_new_titles
         ),
+        "sections": section_highlights,
     }
 
 
@@ -1595,6 +2090,70 @@ def format_title_for_platform(
         return cleaned_title
 
 
+def build_sections_block(sections: Optional[List[Dict]], platform: str) -> str:
+    """为不同推送平台生成精选板块概览"""
+    if not sections:
+        return ""
+
+    block = ""
+    platform = platform.lower()
+
+    if platform == "feishu":
+        block += "🎯 **精选板块速览**\n\n"
+    elif platform in ("dingtalk", "wework", "ntfy"):
+        block += "🎯 **精选板块速览**\n\n"
+    elif platform == "telegram":
+        block += "🎯 精选板块速览\n\n"
+    else:
+        block += "🎯 精选板块速览\n\n"
+
+    for section in sections:
+        section_name = section.get("name", "热点板块")
+        item_count = len(section.get("items", []))
+        escaped_name = html_escape(section_name)
+
+        if platform == "feishu":
+            block += f"**{escaped_name}** ({item_count} 条)\n"
+        elif platform == "telegram":
+            block += f"<b>{escaped_name}</b> ({item_count} 条)\n"
+        else:
+            block += f"**{escaped_name}** ({item_count} 条)\n"
+
+        for idx, item in enumerate(section.get("items", []), 1):
+            formatted_title = format_title_for_platform(platform, item, show_source=True)
+            keyword_group = item.get("keyword_group", "")
+            tag_suffix = ""
+            if keyword_group:
+                sanitized_tag = re.sub(r"\s+", "", keyword_group)
+                if platform == "feishu":
+                    tag_suffix = f" <font color='grey'>#{html_escape(sanitized_tag)}</font>"
+                elif platform == "telegram":
+                    tag_suffix = f" <code>#{html_escape(sanitized_tag)}</code>"
+                else:
+                    tag_suffix = f" (#" + sanitized_tag + ")"
+
+            fallback_reason = item.get("_fallback_reason")
+            fallback_suffix = ""
+            if fallback_reason:
+                if fallback_reason == "keyword_fallback":
+                    label = "关键词补位"
+                else:
+                    label = "热度补位"
+
+                if platform == "feishu":
+                    fallback_suffix = f" <font color='grey'>({label})</font>"
+                elif platform == "telegram":
+                    fallback_suffix = f" <code>({label})</code>"
+                else:
+                    fallback_suffix = f" ({label})"
+
+            block += f"  {idx}. {formatted_title}{tag_suffix}{fallback_suffix}\n"
+
+        block += "\n"
+
+    return block
+
+
 def generate_html_report(
     stats: List[Dict],
     total_titles: int,
@@ -1748,6 +2307,84 @@ def render_html_content(
             
             .content {
                 padding: 24px;
+            }
+
+            .section-digest {
+                margin-bottom: 32px;
+                padding: 20px;
+                background: #f0f4ff;
+                border-radius: 16px;
+                border: 1px solid #e0e7ff;
+            }
+
+            .section-digest-title {
+                font-size: 16px;
+                font-weight: 600;
+                color: #1d1f2c;
+                margin-bottom: 16px;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+
+            .section-card-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 16px;
+            }
+
+            .section-card {
+                background: #fff;
+                border-radius: 12px;
+                padding: 14px;
+                box-shadow: inset 0 0 0 1px #eef2ff;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+
+            .section-card-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+            }
+
+            .section-card-name {
+                font-size: 14px;
+                font-weight: 600;
+                color: #1e1b4b;
+            }
+
+            .section-card-count {
+                font-size: 12px;
+                color: #6366f1;
+                font-weight: 600;
+            }
+
+            .section-card-list {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+
+            .section-card-item {
+                font-size: 13px;
+                line-height: 1.5;
+                color: #1f2933;
+            }
+
+            .section-card-item-title a {
+                color: #2563eb;
+                text-decoration: none;
+            }
+
+            .section-card-item-title a:hover {
+                text-decoration: underline;
+            }
+
+            .section-card-tag {
+                font-size: 11px;
+                color: #94a3b8;
             }
             
             .word-group {
@@ -2132,6 +2769,55 @@ def render_html_content(
             </div>
             
             <div class="content">"""
+
+    if report_data.get("sections"):
+        html += """
+                <div class="section-digest">
+                    <div class="section-digest-title">🎯 精选板块速览</div>
+                    <div class="section-card-grid">"""
+
+        for section in report_data["sections"]:
+            escaped_section = html_escape(section.get("name", "热点板块"))
+            html += f"""
+                        <div class="section-card">
+                            <div class="section-card-header">
+                                <div class="section-card-name">{escaped_section}</div>
+                                <div class="section-card-count">{len(section.get('items', []))} 条</div>
+                            </div>
+                            <div class="section-card-list">"""
+
+            for item in section.get("items", []):
+                escaped_title = html_escape(item.get("title", ""))
+                link_url = item.get("mobile_url") or item.get("url", "")
+                keyword_group = item.get("keyword_group", "")
+                escaped_tag = html_escape(keyword_group.replace(" ", "")) if keyword_group else ""
+
+                html += """
+                                <div class="section-card-item">
+                                    <div class="section-card-item-title">"""
+
+                if link_url:
+                    escaped_url = html_escape(link_url)
+                    html += f'<a href="{escaped_url}" target="_blank">{escaped_title}</a>'
+                else:
+                    html += escaped_title
+
+                html += """
+                                    </div>"""
+
+                if escaped_tag:
+                    html += f"<div class=\"section-card-tag\">#{escaped_tag}</div>"
+
+                html += """
+                                </div>"""
+
+            html += """
+                            </div>
+                        </div>"""
+
+        html += """
+                    </div>
+                </div>"""
 
     # 处理失败ID错误信息
     if report_data["failed_ids"]:
@@ -2650,6 +3336,12 @@ def render_feishu_content(
     """渲染飞书内容"""
     text_content = ""
 
+    sections_block = build_sections_block(report_data.get("sections"), "feishu")
+    if sections_block:
+        text_content += sections_block
+        if report_data["stats"]:
+            text_content += f"{CONFIG['FEISHU_MESSAGE_SEPARATOR']}\n\n"
+
     if report_data["stats"]:
         text_content += f"📊 **热点词汇统计**\n\n"
 
@@ -2747,6 +3439,11 @@ def render_dingtalk_content(
     text_content += f"**类型：** 热点分析报告\n\n"
 
     text_content += "---\n\n"
+
+    sections_block = build_sections_block(report_data.get("sections"), "dingtalk")
+    if sections_block:
+        text_content += sections_block
+        text_content += "---\n\n"
 
     if report_data["stats"]:
         text_content += f"📊 **热点词汇统计**\n\n"
@@ -2901,6 +3598,21 @@ def split_content_into_batches(
 
     current_batch = base_header
     current_batch_has_content = False
+
+    sections_block = build_sections_block(report_data.get("sections"), format_type)
+    if sections_block:
+        test_content = current_batch + sections_block
+        if (
+            len(test_content.encode("utf-8")) + len(base_footer.encode("utf-8"))
+            >= max_bytes
+        ):
+            if current_batch_has_content:
+                batches.append(current_batch + base_footer)
+            current_batch = base_header + sections_block
+            current_batch_has_content = True
+        else:
+            current_batch = test_content
+            current_batch_has_content = True
 
     if (
         not report_data["stats"]
@@ -4397,6 +5109,63 @@ class NewsAnalyzer:
         results, id_to_name, failed_ids = self.data_fetcher.crawl_websites(
             ids, self.request_interval
         )
+
+        twitter_cfg = CONFIG.get("TWITTER_TRENDS", {})
+        if twitter_cfg.get("enabled") and twitter_cfg.get("regions"):
+            proxy_for_twitter = self.proxy_url if twitter_cfg.get("use_proxy") else None
+            twitter_fetcher = TwitterTrendsFetcher(
+                base_url=twitter_cfg.get("base_url", "https://trends24.in"),
+                proxy_url=proxy_for_twitter,
+                timeout=twitter_cfg.get("timeout", 12),
+            )
+
+            for region in twitter_cfg.get("regions", []):
+                region_id = region.get("id")
+                slug = region.get("slug")
+                region_name = region.get("name", region_id or slug)
+
+                if not region_id or not slug:
+                    continue
+
+                print(f"开始抓取 Twitter 趋势: {region_name} ({slug})")
+                try:
+                    topics = twitter_fetcher.fetch_region_trends(slug, limit=region.get("limit", twitter_cfg.get("default_limit", 20)))
+                    if not topics:
+                        print(f"Twitter 趋势 {region_name} 无数据返回")
+                        failed_ids.append(region_id)
+                        continue
+
+                    id_to_name[region_id] = region_name
+                    results[region_id] = {}
+                    for index, topic in enumerate(topics, 1):
+                        title = topic.get("title")
+                        if not title:
+                            continue
+
+                        url = topic.get("url", "")
+                        metadata = {
+                            "timestamp": topic.get("timestamp", ""),
+                            "tweetCount": topic.get("tweet_count", ""),
+                            "source": "twitter_trends24",
+                        }
+
+                        results[region_id][title] = {
+                            "ranks": [index],
+                            "url": url,
+                            "mobileUrl": url,
+                            "metadata": metadata,
+                        }
+
+                    print(
+                        f"Twitter 趋势 {region_name} 获取完成，共 {len(results[region_id])} 条"
+                    )
+                except Exception as exc:
+                    print(f"Twitter 趋势 {region_name} 抓取失败: {exc}")
+                    failed_ids.append(region_id)
+
+                interval = twitter_cfg.get("request_interval", 0)
+                if interval > 0:
+                    time.sleep(interval)
 
         title_file = save_titles_to_file(results, id_to_name, failed_ids)
         print(f"标题已保存到: {title_file}")

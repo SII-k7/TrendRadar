@@ -99,3 +99,22 @@ platforms:
     name: "抖音"
   - id: "zhihu"
     name: "知乎"
+
+# X (Twitter) 趋势配置
+# 使用 trends24.in 的公开页面提取实时趋势，只获取“just now”时间段的榜单
+twitter_trends:
+  enabled: true
+  base_url: "https://trends24.in"
+  default_limit: 20         # 每个地区最多提取的趋势条数
+  request_interval: 2       # 多个地区连续抓取时的间隔（秒）
+  timeout: 12               # HTTP 请求超时（秒）
+  use_proxy: false          # 如需通过本地代理访问 trends24，可开启
+  regions:
+    - id: "x-china"
+      name: "X 趋势 · 中国"
+      slug: "china"
+      limit: 20
+    - id: "x-global"
+      name: "X 趋势 · 美国"
+      slug: "united-states"
+      limit: 20
