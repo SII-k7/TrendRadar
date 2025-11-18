@@ -27,6 +27,7 @@ crawler:
 report:
   mode: "daily" # 可选: "daily"|"incremental"|"current"
   rank_threshold: 5 # 排名高亮阈值
+  sections_only: true # 仅推送精选板块（A股/H股、国内、国外），隐藏热点词汇统计
 
 notification:
   enable_notification: true # 是否启用通知功能，如果 false，则不发送手机通知
