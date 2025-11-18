@@ -125,7 +125,8 @@ twitter_trends:
 # 通过 Twitter/X 官方 API 获取特定关键词/话题的最新推文
 twitter_api:
   enabled: true
-  bearer_token_env: "TWITTER_BEARER_TOKEN"   # 请将 Bearer Token 写入同名环境变量
+  # bearer_token_env: "TWITTER_BEARER_TOKEN"   # 请将 Bearer Token 写入同名环境变量
+  bearer_token_env: "AAAAAAAAAAAAAAAAAAAAAED35QEAAAAASr4O3%2BoDJpoTDejNiH2E%2B8Q%2BjJY%3DA4bEjaX3AiaKuOD9LWY2QKVeKpqIpEOD7yNOcuM4s0pC8pEtPC"   # 请将 Bearer Token 写入同名环境变量
   max_results: 10                            # 每个查询最多返回多少条推文（5-100）
   timeout: 15                                # 调用官方 API 的超时时间（秒）
   queries:
